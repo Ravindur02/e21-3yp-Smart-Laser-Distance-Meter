@@ -12,19 +12,67 @@ router.use(authMiddleware);
 router.post('/upload', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { project, shapes, roomObjects } = req.body;
+    const { project, shapes, roomObjects, furnitureItems, last_modified_at } = req.body;
 
     // transaction — either everything saves or nothing saves
     await client.query('BEGIN');
 
     // 1. Upsert project
     let cloudProjectId;
+
+    // If Flutter already knows the cloud project id, find it regardless of owner
+    // (collaborators with edit access also need to update the shared project)
+    if (project.cloud_project_id) {
+      const byId = await client.query(
+        'SELECT id, updated_at FROM projects WHERE id = $1',
+        [project.cloud_project_id]
+      );
+      if (byId.rows.length > 0) {
+        cloudProjectId = byId.rows[0].id;
+      }
+    }
+
+    // Fall back to local_id lookup (owner's own projects only)
     const existing = await client.query(
-      'SELECT id FROM projects WHERE user_id = $1 AND local_id = $2',
-      [req.user.userId, project.local_id]
+      cloudProjectId
+        ? 'SELECT id, updated_at FROM projects WHERE id = $1'
+        : 'SELECT id, updated_at FROM projects WHERE user_id = $1 AND local_id = $2',
+      cloudProjectId ? [cloudProjectId] : [req.user.userId, project.local_id]
     );
+
     if (existing.rows.length > 0) {
       cloudProjectId = existing.rows[0].id;
+
+      // Verify edit permission: owner always allowed; collaborator needs can_edit=true
+      const projectMeta = await client.query(
+        'SELECT user_id FROM projects WHERE id = $1', [cloudProjectId]
+      );
+      if (projectMeta.rows[0].user_id !== req.user.userId) {
+        const editCheck = await client.query(
+          `SELECT can_edit FROM project_collaborators
+           WHERE project_id = $1 AND user_id = $2 AND status = 'accepted'`,
+          [cloudProjectId, req.user.userId]
+        );
+        if (editCheck.rows.length === 0 || !editCheck.rows[0].can_edit) {
+          await client.query('ROLLBACK');
+          client.release();
+          return res.status(403).json({ error: 'Edit access not granted' });
+        }
+      }
+
+      // Conflict detection
+      if (last_modified_at) {
+        const serverUpdatedAt = existing.rows[0].updated_at;
+        if (serverUpdatedAt && new Date(serverUpdatedAt) > new Date(last_modified_at)) {
+          await client.query('ROLLBACK');
+          client.release();
+          return res.status(409).json({
+            conflict: true,
+            server_updated_at: serverUpdatedAt.toISOString(),
+          });
+        }
+      }
+
       await client.query(
         'UPDATE projects SET name = $1, updated_at = NOW() WHERE id = $2',
         [project.name, cloudProjectId]
@@ -38,8 +86,9 @@ router.post('/upload', async (req, res) => {
         await client.query('DELETE FROM wall_angles   WHERE shape_id = $1', [row.id]);
         await client.query('DELETE FROM wall_lengths  WHERE shape_id = $1', [row.id]);
       }
-      await client.query('DELETE FROM shapes       WHERE project_id = $1', [cloudProjectId]);
-      await client.query('DELETE FROM room_objects  WHERE project_id = $1', [cloudProjectId]);
+      await client.query('DELETE FROM shapes          WHERE project_id = $1', [cloudProjectId]);
+      await client.query('DELETE FROM room_objects    WHERE project_id = $1', [cloudProjectId]);
+      await client.query('DELETE FROM furniture_items WHERE project_id = $1', [cloudProjectId]);
     } else {
       const inviteCode = Math.random().toString(36).substring(2, 6).toUpperCase() +
                          Math.random().toString(36).substring(2, 6).toUpperCase();
@@ -102,8 +151,8 @@ router.post('/upload', async (req, res) => {
       await client.query(
         `INSERT INTO room_objects
          (project_id, object_id, type, wall_index, position_along,
-          width_mm, height_mm, elevation_mm)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          width_mm, height_mm, elevation_mm, shape_index)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
         [
           cloudProjectId,
           obj.object_id,
@@ -113,15 +162,42 @@ router.post('/upload', async (req, res) => {
           obj.width_mm,
           obj.height_mm,
           obj.elevation_mm,
+          obj.shape_index ?? 0,
+        ]
+      );
+    }
+
+    // 4. Save furniture items
+    for (const f of (furnitureItems || [])) {
+      await client.query(
+        `INSERT INTO furniture_items
+         (project_id, shape_index, furniture_id, type,
+          position_x, position_y, rotation_deg, width_mm, depth_mm)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          cloudProjectId,
+          f.shape_index ?? 0,
+          f.furniture_id,
+          f.type,
+          f.position_x,
+          f.position_y,
+          f.rotation_deg ?? 0,
+          f.width_mm,
+          f.depth_mm,
         ]
       );
     }
 
     await client.query('COMMIT'); // save everything
 
+    const uploaded = await client.query(
+      'SELECT updated_at FROM projects WHERE id = $1',
+      [cloudProjectId]
+    );
     res.json({
       message: 'Project uploaded successfully',
       cloud_project_id: cloudProjectId,
+      updated_at: uploaded.rows[0].updated_at.toISOString(),
     });
 
   } catch (err) {
@@ -201,10 +277,17 @@ router.get('/download/:projectId', async (req, res) => {
       [projectId]
     );
 
+    // Get furniture items for this project
+    const furnitureResult = await pool.query(
+      'SELECT * FROM furniture_items WHERE project_id = $1',
+      [projectId]
+    );
+
     res.json({
       project: projectResult.rows[0],
       shapes: shapesWithData,
       roomObjects: objectsResult.rows,
+      furnitureItems: furnitureResult.rows,
     });
 
   } catch (err) {
@@ -265,17 +348,106 @@ router.get('/updates/:projectId', async (req, res) => {
     const objectsResult = await pool.query(
       'SELECT * FROM room_objects WHERE project_id = $1', [projectId]
     );
+    const furnitureResult = await pool.query(
+      'SELECT * FROM furniture_items WHERE project_id = $1', [projectId]
+    );
 
     res.json({
       updated: true,
       project,
       shapes: shapesWithData,
       roomObjects: objectsResult.rows,
+      furnitureItems: furnitureResult.rows,
     });
 
   } catch (err) {
     console.error('Updates error:', err);
     res.status(500).json({ error: 'Failed to check updates' });
+  }
+});
+
+// POST /sync/heartbeat
+// Flutter calls this every 30 s while the sketch screen is open
+router.post('/heartbeat', async (req, res) => {
+  try {
+    const { project_id } = req.body;
+    if (!project_id) return res.status(400).json({ error: 'project_id required' });
+
+    // Verify the caller has access (owner or accepted collaborator)
+    const access = await pool.query(
+      `SELECT 1 FROM projects p
+       WHERE p.id = $1
+         AND (
+           p.user_id = $2
+           OR EXISTS (
+             SELECT 1 FROM project_collaborators pc
+             WHERE pc.project_id = p.id
+               AND pc.user_id = $2
+               AND pc.status = 'accepted'
+           )
+         )`,
+      [project_id, req.user.userId]
+    );
+    if (access.rows.length === 0) {
+      return res.status(404).json({ error: 'Access denied' });
+    }
+
+    // Upsert presence — create or refresh the timestamp
+    await pool.query(
+      `INSERT INTO project_presence (project_id, user_id, last_seen_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (project_id, user_id)
+       DO UPDATE SET last_seen_at = NOW()`,
+      [project_id, req.user.userId]
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Heartbeat error:', err);
+    res.status(500).json({ error: 'Heartbeat failed' });
+  }
+});
+
+// GET /sync/active-collaborators/:projectId
+// Returns other users seen on this project in the last 2 minutes
+router.get('/active-collaborators/:projectId', async (req, res) => {
+  try {
+    const projectId = req.params.projectId;
+
+    // Verify access
+    const access = await pool.query(
+      `SELECT 1 FROM projects p
+       WHERE p.id = $1
+         AND (
+           p.user_id = $2
+           OR EXISTS (
+             SELECT 1 FROM project_collaborators pc
+             WHERE pc.project_id = p.id
+               AND pc.user_id = $2
+               AND pc.status = 'accepted'
+           )
+         )`,
+      [projectId, req.user.userId]
+    );
+    if (access.rows.length === 0) {
+      return res.status(404).json({ error: 'Access denied' });
+    }
+
+    const result = await pool.query(
+      `SELECT u.email, pp.last_seen_at
+       FROM project_presence pp
+       JOIN users u ON u.id = pp.user_id
+       WHERE pp.project_id = $1
+         AND pp.user_id != $2
+         AND pp.last_seen_at > NOW() - INTERVAL '2 minutes'
+       ORDER BY pp.last_seen_at DESC`,
+      [projectId, req.user.userId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Active collaborators error:', err);
+    res.status(500).json({ error: 'Failed to get active collaborators' });
   }
 });
 

@@ -8,6 +8,8 @@ import '../database/database_helper.dart';
 import '../sketch/sketch_screen.dart';
 import '../sketch/sketch_model.dart';
 import '../sketch/room_object.dart';
+import '../sketch/furniture_item.dart';
+import '../services/sync_service.dart';
 
 class CollaborationScreen extends StatefulWidget {
   const CollaborationScreen({super.key});
@@ -85,7 +87,8 @@ class _CollaborationScreenState extends State<CollaborationScreen>
 
   // ── Open shared project with live polling ────────────────────────────────
 
-  Future<void> _openLive(int cloudProjectId, String name) async {
+  Future<void> _openLive(int cloudProjectId, String name,
+      {bool canEdit = false}) async {
     setState(() => _working = true);
     final data = await ApiService.downloadProject(cloudProjectId);
     if (data == null) {
@@ -110,6 +113,7 @@ class _CollaborationScreenState extends State<CollaborationScreen>
           initialWallAngles: wallAngles,
           initialWallLengths: wallLengths,
           lastKnownUpdatedAt: lastUpdatedAt,
+          canEdit: canEdit,
         ),
       ),
     );
@@ -263,45 +267,96 @@ class _CollaborationScreenState extends State<CollaborationScreen>
     if (!mounted) return;
     showDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFF1A2A3A),
-        title: Text('Collaborators — $name',
-            style: const TextStyle(color: Colors.white, fontSize: 15)),
-        content: list.isEmpty
-            ? const Text('No one has joined yet.',
-                style: TextStyle(color: Color(0xFF778899)))
-            : SizedBox(
-                width: 280,
-                child: ListView.separated(
-                  shrinkWrap: true,
-                  itemCount: list.length,
-                  separatorBuilder: (_, __) =>
-                      const Divider(color: Color(0xFF334466), height: 1),
-                  itemBuilder: (_, i) {
-                    final c = list[i];
-                    return ListTile(
-                      dense: true,
-                      leading: const Icon(Icons.person_outline,
-                          color: Color(0xFF00AAFF), size: 18),
-                      title: Text(c['email'] as String,
-                          style: const TextStyle(
-                              color: Colors.white, fontSize: 13)),
-                      subtitle: Text(
-                        '${c['role']} · joined ${_shortDate(c['joined_at'])}',
-                        style: const TextStyle(
-                            color: Color(0xFF556677), fontSize: 11),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          backgroundColor: const Color(0xFF1A2A3A),
+          title: Text('Collaborators — $name',
+              style: const TextStyle(color: Colors.white, fontSize: 15)),
+          content: list.isEmpty
+              ? const Text('No one has joined yet.',
+                  style: TextStyle(color: Color(0xFF778899)))
+              : SizedBox(
+                  width: 320,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Padding(
+                        padding: EdgeInsets.only(bottom: 8),
+                        child: Text(
+                          'Toggle "Can Edit" to let a collaborator\nmake and sync changes.',
+                          style: TextStyle(
+                              color: Color(0xFF778899), fontSize: 12),
+                        ),
                       ),
-                    );
-                  },
+                      ListView.separated(
+                        shrinkWrap: true,
+                        itemCount: list.length,
+                        separatorBuilder: (_, __) =>
+                            const Divider(color: Color(0xFF334466), height: 1),
+                        itemBuilder: (_, i) {
+                          final c = list[i];
+                          final email = c['email'] as String;
+                          final canEdit = (c['can_edit'] as bool?) ?? false;
+                          return ListTile(
+                            dense: true,
+                            leading: Icon(
+                              canEdit ? Icons.edit : Icons.visibility,
+                              color: canEdit
+                                  ? const Color(0xFF00FF99)
+                                  : const Color(0xFF556677),
+                              size: 18,
+                            ),
+                            title: Text(email,
+                                style: const TextStyle(
+                                    color: Colors.white, fontSize: 13)),
+                            subtitle: Text(
+                              canEdit ? 'Can edit & sync' : 'View only',
+                              style: TextStyle(
+                                color: canEdit
+                                    ? const Color(0xFF00AA66)
+                                    : const Color(0xFF556677),
+                                fontSize: 11,
+                              ),
+                            ),
+                            trailing: Switch(
+                              value: canEdit,
+                              activeColor: const Color(0xFF00FF99),
+                              inactiveThumbColor: const Color(0xFF556677),
+                              inactiveTrackColor: const Color(0xFF223344),
+                              onChanged: (val) async {
+                                final ok = await ApiService.setEditAccess(
+                                    cloudProjectId, email, val);
+                                if (ok) {
+                                  setDialogState(() {
+                                    list[i] = {...c, 'can_edit': val};
+                                  });
+                                } else {
+                                  if (ctx.mounted) {
+                                    ScaffoldMessenger.of(ctx).showSnackBar(
+                                      const SnackBar(
+                                        content: Text('Failed to update access'),
+                                        backgroundColor: Colors.red,
+                                      ),
+                                    );
+                                  }
+                                }
+                              },
+                            ),
+                          );
+                        },
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Close',
-                style: TextStyle(color: Color(0xFF556677))),
-          ),
-        ],
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Close',
+                  style: TextStyle(color: Color(0xFF556677))),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -376,19 +431,44 @@ class _CollaborationScreenState extends State<CollaborationScreen>
             .map((r) => (r['length'] as num).toDouble())
             .toList();
 
-    final roomObjects = objectsData.map<RoomObject>((r) {
-      return RoomObject(
+    // Distribute room objects to their correct shape
+    final roomObjects = <RoomObject>[];
+    for (final r in objectsData) {
+      final obj = RoomObject(
         id: r['object_id'] as String,
-        type: r['type'] == 'door'
-            ? RoomObjectType.door
-            : RoomObjectType.window,
+        type: r['type'] == 'door' ? RoomObjectType.door : RoomObjectType.window,
         wallIndex: r['wall_index'] as int,
         positionAlong: (r['position_along'] as num).toDouble(),
         widthMm: (r['width_mm'] as num).toDouble(),
         heightMm: (r['height_mm'] as num).toDouble(),
         elevationMm: (r['elevation_mm'] as num).toDouble(),
       );
-    }).toList();
+      roomObjects.add(obj);
+      final si = (r['shape_index'] as num?)?.toInt() ?? 0;
+      if (si < shapes.length) shapes[si].roomObjects.add(obj);
+    }
+
+    // Distribute furniture items to their correct shape
+    final furnitureData = data['furnitureItems'] as List<dynamic>? ?? [];
+    for (final f in furnitureData) {
+      final si = (f['shape_index'] as num?)?.toInt() ?? 0;
+      if (si < shapes.length) {
+        shapes[si].furnitureItems.add(FurnitureItem(
+          id: f['furniture_id'] as String,
+          type: FurnitureType.values.firstWhere(
+            (t) => t.name == f['type'],
+            orElse: () => FurnitureType.sofa,
+          ),
+          position: Offset(
+            (f['position_x'] as num).toDouble(),
+            (f['position_y'] as num).toDouble(),
+          ),
+          rotationDeg: (f['rotation_deg'] as num).toDouble(),
+          widthMm: (f['width_mm'] as num).toDouble(),
+          depthMm: (f['depth_mm'] as num).toDouble(),
+        ));
+      }
+    }
 
     return (shapes, roomObjects, wallAngles, wallLengths);
   }
@@ -505,6 +585,8 @@ class _CollaborationScreenState extends State<CollaborationScreen>
                     color: Color(0xFF778899)),
                 onSelected: (action) {
                   switch (action) {
+                    case 'open_live':
+                      _openLive(id, name, canEdit: true);
                     case 'restore':
                       _restoreProject(id, name);
                     case 'invite':
@@ -514,6 +596,16 @@ class _CollaborationScreenState extends State<CollaborationScreen>
                   }
                 },
                 itemBuilder: (_) => [
+                  const PopupMenuItem(
+                    value: 'open_live',
+                    child: Row(children: [
+                      Icon(Icons.sync,
+                          color: Color(0xFF00FF99), size: 16),
+                      SizedBox(width: 8),
+                      Text('Open live',
+                          style: TextStyle(color: Colors.white)),
+                    ]),
+                  ),
                   const PopupMenuItem(
                     value: 'restore',
                     child: Row(children: [
@@ -609,9 +701,10 @@ class _CollaborationScreenState extends State<CollaborationScreen>
                 icon: const Icon(Icons.more_vert,
                     color: Color(0xFF778899)),
                 onSelected: (action) {
+                  final canEdit = (p['can_edit'] as bool?) ?? false;
                   switch (action) {
                     case 'open_live':
-                      _openLive(id, name);
+                      _openLive(id, name, canEdit: canEdit);
                     case 'restore':
                       _restoreProject(id, name);
                     case 'leave':
@@ -671,6 +764,7 @@ class _LiveCollabWrapper extends StatefulWidget {
   final List<double> initialWallAngles;
   final List<double> initialWallLengths;
   final String lastKnownUpdatedAt;
+  final bool canEdit;
 
   const _LiveCollabWrapper({
     required this.cloudProjectId,
@@ -679,6 +773,7 @@ class _LiveCollabWrapper extends StatefulWidget {
     required this.initialWallAngles,
     required this.initialWallLengths,
     required this.lastKnownUpdatedAt,
+    this.canEdit = false,
   });
 
   @override
@@ -687,6 +782,7 @@ class _LiveCollabWrapper extends StatefulWidget {
 
 class _LiveCollabWrapperState extends State<_LiveCollabWrapper> {
   Timer? _pollTimer;
+  StreamSubscription? _uploadSub;
   String _lastUpdatedAt = '';
   bool _syncing = false;
   DateTime? _lastSyncTime;
@@ -704,11 +800,21 @@ class _LiveCollabWrapperState extends State<_LiveCollabWrapper> {
     _wallLengths = widget.initialWallLengths;
     _pollTimer =
         Timer.periodic(const Duration(seconds: 10), (_) => _poll());
+
+    // When canEdit=true, track our own uploads so the poll doesn't
+    // mistake our own upload as "someone else's change" and rebuild.
+    if (widget.canEdit) {
+      _uploadSub = SyncService.instance.uploadSuccessStream.listen((event) {
+        final updatedAt = event['updated_at'] as String?;
+        if (updatedAt != null) _lastUpdatedAt = updatedAt;
+      });
+    }
   }
 
   @override
   void dispose() {
     _pollTimer?.cancel();
+    _uploadSub?.cancel();
     super.dispose();
   }
 
@@ -724,40 +830,94 @@ class _LiveCollabWrapperState extends State<_LiveCollabWrapper> {
       return;
     }
 
-    if (data != null) {
-      _lastUpdatedAt =
-          data['project']['updated_at'] as String? ?? _lastUpdatedAt;
+    if (data == null) {
+      _syncing = false;
+      return;
+    }
+    _lastUpdatedAt =
+        data['project']['updated_at'] as String? ?? _lastUpdatedAt;
 
-      final newShapes =
-          (data['shapes'] as List<dynamic>).map<SketchShape>((s) {
-        final shape = SketchShape.empty();
-        shape.isClosed = s['is_closed'] as bool;
-        shape.points = (s['points'] as List<dynamic>)
-            .map((r) => Offset(
-                  (r['x'] as num).toDouble(),
-                  (r['y'] as num).toDouble(),
-                ))
-            .toList();
-        for (final r in s['wall_real_mm'] as List<dynamic>) {
-          shape.wallRealMm[r['wall_index'] as int] =
-              (r['real_mm'] as num).toDouble();
-        }
-        return shape;
-      }).toList();
+    final shapesData = data['shapes'] as List<dynamic>;
+    final objectsData = data['roomObjects'] as List<dynamic>;
+    final newShapes = shapesData.map<SketchShape>((s) {
+      final shape = SketchShape.empty();
+      shape.isClosed = s['is_closed'] as bool;
+      shape.points = (s['points'] as List<dynamic>)
+          .map((r) => Offset(
+                (r['x'] as num).toDouble(),
+                (r['y'] as num).toDouble(),
+              ))
+          .toList();
+      for (final r in s['wall_real_mm'] as List<dynamic>) {
+        shape.wallRealMm[r['wall_index'] as int] =
+            (r['real_mm'] as num).toDouble();
+      }
+      return shape;
+    }).toList();
 
-      setState(() {
-        _shapes = newShapes;
-        _lastSyncTime = DateTime.now();
-        _sketchKey = UniqueKey();
-      });
+    // Distribute room objects to their correct shape
+    for (final r in objectsData) {
+      final obj = RoomObject(
+        id: r['object_id'] as String,
+        type: r['type'] == 'door' ? RoomObjectType.door : RoomObjectType.window,
+        wallIndex: r['wall_index'] as int,
+        positionAlong: (r['position_along'] as num).toDouble(),
+        widthMm: (r['width_mm'] as num).toDouble(),
+        heightMm: (r['height_mm'] as num).toDouble(),
+        elevationMm: (r['elevation_mm'] as num).toDouble(),
+      );
+      final si = (r['shape_index'] as num?)?.toInt() ?? 0;
+      if (si < newShapes.length) newShapes[si].roomObjects.add(obj);
+    }
 
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Project updated by owner'),
-          backgroundColor: Color(0xFF004488),
-          duration: Duration(seconds: 2),
+    // Distribute furniture items to their correct shape
+    final furnitureData = data['furnitureItems'] as List<dynamic>? ?? [];
+    for (final f in furnitureData) {
+      final si = (f['shape_index'] as num?)?.toInt() ?? 0;
+      if (si < newShapes.length) {
+        newShapes[si].furnitureItems.add(FurnitureItem(
+          id: f['furniture_id'] as String,
+          type: FurnitureType.values.firstWhere(
+            (t) => t.name == f['type'],
+            orElse: () => FurnitureType.sofa,
+          ),
+          position: Offset(
+            (f['position_x'] as num).toDouble(),
+            (f['position_y'] as num).toDouble(),
+          ),
+          rotationDeg: (f['rotation_deg'] as num).toDouble(),
+          widthMm: (f['width_mm'] as num).toDouble(),
+          depthMm: (f['depth_mm'] as num).toDouble(),
         ));
       }
+    }
+
+    // Also update wall angles and lengths from the first shape
+    final newAngles = shapesData.isEmpty
+        ? <double>[]
+        : (shapesData.first['wall_angles'] as List<dynamic>)
+            .map((r) => (r['angle'] as num).toDouble())
+            .toList();
+    final newLengths = shapesData.isEmpty
+        ? <double>[]
+        : (shapesData.first['wall_lengths'] as List<dynamic>)
+            .map((r) => (r['length'] as num).toDouble())
+            .toList();
+
+    setState(() {
+      _shapes = newShapes;
+      _wallAngles = newAngles;
+      _wallLengths = newLengths;
+      _lastSyncTime = DateTime.now();
+      _sketchKey = UniqueKey();
+    });
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Project updated'),
+        backgroundColor: Color(0xFF004488),
+        duration: Duration(seconds: 2),
+      ));
     }
     _syncing = false;
   }
@@ -769,6 +929,11 @@ class _LiveCollabWrapperState extends State<_LiveCollabWrapper> {
         SketchScreen(
           key: _sketchKey,
           bleManager: null,
+          initialShapes: _shapes,
+          initialWallAngles: _wallAngles,
+          initialWallLengths: _wallLengths,
+          cloudProjectId: widget.cloudProjectId,
+          canEdit: widget.canEdit,
         ),
         Positioned(
           top: 56,
@@ -777,22 +942,39 @@ class _LiveCollabWrapperState extends State<_LiveCollabWrapper> {
             padding:
                 const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
             decoration: BoxDecoration(
-              color: const Color(0xFF004422),
+              color: widget.canEdit
+                  ? const Color(0xFF1A3A00)
+                  : const Color(0xFF004422),
               borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: const Color(0xFF00AA44)),
+              border: Border.all(
+                color: widget.canEdit
+                    ? const Color(0xFF88FF00)
+                    : const Color(0xFF00AA44),
+              ),
             ),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                const Icon(Icons.sync,
-                    color: Color(0xFF00AA44), size: 12),
+                Icon(
+                  widget.canEdit ? Icons.edit : Icons.visibility,
+                  color: widget.canEdit
+                      ? const Color(0xFF88FF00)
+                      : const Color(0xFF00AA44),
+                  size: 12,
+                ),
                 const SizedBox(width: 4),
                 Text(
-                  _lastSyncTime == null
-                      ? 'Live sync active'
-                      : 'Synced ${_timeAgo(_lastSyncTime!)}',
-                  style: const TextStyle(
-                    color: Color(0xFF00AA44),
+                  widget.canEdit
+                      ? (_lastSyncTime == null
+                          ? 'Edit mode · live'
+                          : 'Edit mode · ${_timeAgo(_lastSyncTime!)}')
+                      : (_lastSyncTime == null
+                          ? 'View only · live'
+                          : 'View only · ${_timeAgo(_lastSyncTime!)}'),
+                  style: TextStyle(
+                    color: widget.canEdit
+                        ? const Color(0xFF88FF00)
+                        : const Color(0xFF00AA44),
                     fontSize: 10,
                     fontFamily: 'monospace',
                   ),
