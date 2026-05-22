@@ -42,8 +42,9 @@ dependencies:
   http: ^1.2.0
   flutter_secure_storage: ^9.0.0
   connectivity_plus: ^6.0.3
-  webview_flutter: ^4.10.0
+  webview_flutter: ^4.9.0
   ar_flutter_plugin_2: ^0.0.3
+  model_viewer_plus: ^1.8.0
   permission_handler: ^11.3.1
   vector_math: ^2.1.0
 
