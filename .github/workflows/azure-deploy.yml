@@ -1,0 +1,31 @@
+name: Build and deploy Node.js app to Azure Web App - smartmeasure-backend
+
+on:
+  push:
+    branches:
+      - backend-host-azure
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '22.x'
+
+      - name: Install dependencies
+        run: |
+          cd code/smartmeasure-backend
+          npm ci
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: 'smartmeasure-backend'
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: code/smartmeasure-backend
