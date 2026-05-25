@@ -3,12 +3,12 @@ require('dotenv').config();
 
 // Supports two modes:
 // - Local development: uses individual DB_* variables from .env
-// - Railway (production): uses single DATABASE_URL with SSL
+// - Azure (production): uses individual DB_* variables with SSL
 const pool = new Pool(
   process.env.DATABASE_URL
     ? {
         connectionString: process.env.DATABASE_URL,
-        ssl: { rejectUnauthorized: false }, // required by Railway
+        ssl: { rejectUnauthorized: false },
       }
     : {
         host: process.env.DB_HOST,
@@ -16,6 +16,7 @@ const pool = new Pool(
         database: process.env.DB_NAME,
         user: process.env.DB_USER,
         password: process.env.DB_PASSWORD,
+        ssl: { rejectUnauthorized: false }  // Required for Azure PostgreSQL
       }
 );
 
