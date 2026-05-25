@@ -32,4 +32,4 @@ jobs:
         uses: azure/webapps-deploy@v3
         with:
           app-name: 'smartmeasure-backend'
-          package: code/smartmeasure-backend
+          package: ./code/smartmeasure-backend
