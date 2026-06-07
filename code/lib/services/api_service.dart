@@ -7,7 +7,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 class ApiService {
   static const String baseUrl =
-      'https://e21-3yp-smart-laser-distance-meter-production.up.railway.app';
+      'https://smartmeasure-backend-cgbkckdxhcaxesgm.southeastasia-01.azurewebsites.net';
 
   static const _storage = FlutterSecureStorage();
 
